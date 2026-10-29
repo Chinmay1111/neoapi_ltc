@@ -1,49 +1,33 @@
 """
-websocket.py - Kotak Neo API Live WebSocket Market Data Streamer
+websocket.py - Kotak Neo API Live SFeed WebSocket Market Data Streamer
 
-Streams real-time live market feed (LTP, OHLC, Volume, OI, Best Bid/Ask Depth)
-for Nifty Futures (or any other scrip) using the official Kotak Neo API SDK
-(SFeed WebSocket).
+Streams real-time live market feed for Nifty Futures (or any specified scrip)
+with a clean, professional terminal UI matching the exact Kotak Neo SFeed layout.
 
-Features:
-1. Automatic Scrip Master Lookup:
-   - Queries Kotak Neo Scrip Master (nse_fo) to automatically resolve
-     the instrument token, trading symbol, expiry date, and lot size.
-   - Built-in multi-tier fallback (API -> local disk cache -> direct download)
-     ensuring resilience against Kotak nighttime API maintenance (503 errors).
-   - Defaults to the active Current Month Nifty Future.
-2. Full Trading Authentication:
-   - Authenticates via login.py using credentials stored in .env or interactive login.
-3. Modern Async SFeed WebSocket:
-   - Uses client.create_websocket() with auto-reconnect and native ping-pong.
-4. Rich Terminal Dashboard:
-   - Color-coded tick output (Green for Up, Red for Down).
-   - Shows LTP, Net Change (pts and %), High/Low, Volume, OI, and Best Bid/Ask.
-5. Programmatic API:
-   - Can be imported into trading algorithms or strategies:
-     from websocket import stream_live_quotes, get_nifty_future_scrip
+UI Layout:
+[*] Querying Scrip Master for symbol='NIFTY' on segment='nse_fo'...
 
-Usage:
-    # Run default (Auto-detect active Current Month Nifty Future):
-    python websocket.py
+┌────────────────────────────────────────────────────────────┐
+│        KOTAK NEO SFEED WEBSOCKET - LIVE MARKET DATA        │
+├────────────────────────────────────────────────────────────┤
+│ Trading Symbol  : NIFTY26NOVFUT   Segment   : nse_fo       │
+│ Instrument Token: 61471           Inst Type : FUTIDX       │
+│ Expiry Date     : 26Nov2026       Market Lot: 65           │
+└────────────────────────────────────────────────────────────┘
 
-    # Specify an expiry hint:
-    python websocket.py --expiry NOV
+[*] Streaming live ticks (Press Ctrl+C to disconnect safely)...
 
-    # Specify a custom instrument token directly:
-    python websocket.py --token 61471
-
-    # Stream 5 depth levels:
-    python websocket.py --depth
-
-    # Capture 5 ticks and exit (useful for testing):
-    python websocket.py --count 5
+  TIME   |   LTP (₹)   |      CHANGE      |   HIGH (₹)   |   LOW (₹)    | OPEN INTEREST
+──────────────────────────────────────────────────────────────────────────────────────────
+ 09:15:02 | ₹ 24,525.50 |  +25.50 (+0.10%) |  24,540.00   |   24,495.00  |    16,050,000
 """
 
 import argparse
 import asyncio
+import contextlib
 import datetime
 import io
+import logging
 import os
 import sys
 from pathlib import Path
@@ -59,6 +43,15 @@ if sys.platform == "win32":
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+# Silence noisy SDK background logger output so it doesn't break the table
+logging.getLogger("neo_api_client").setLevel(logging.ERROR)
+logging.getLogger("websockets").setLevel(logging.ERROR)
+try:
+    import structlog
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR))
+except Exception:
+    pass
 
 # Ensure root directory is in sys.path
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -78,7 +71,34 @@ except ImportError as err:
     )
     sys.exit(1)
 
-from login import Colors, get_client, load_env_file, login, print_banner
+from login import Colors, load_env_file, login
+
+
+# =====================================================================
+# Silent Authentication Helper
+# =====================================================================
+
+def silent_login(verbose: bool = False) -> NeoAPI:
+    """
+    Authenticate with Kotak Neo.
+    If verbose is False and credentials exist in .env, suppresses login banners
+    so the terminal opens cleanly into the live market table.
+    """
+    load_env_file()
+    has_env = all(
+        os.environ.get(k)
+        for k in ["NEO_CONSUMER_KEY", "NEO_MOBILE_NUMBER", "NEO_UCC", "NEO_MPIN"]
+    )
+
+    if not verbose and has_env:
+        # Suppress login banners to keep terminal output clean
+        devnull = io.StringIO()
+        with contextlib.redirect_stdout(devnull):
+            client, _ = login(show_limits=False)
+        return client
+    else:
+        client, _ = login(show_limits=False)
+        return client
 
 
 # =====================================================================
@@ -86,7 +106,7 @@ from login import Colors, get_client, load_env_file, login, print_banner
 # =====================================================================
 
 def _load_scrip_dataframe_from_cache(segment: str = "nse_fo") -> Optional[pd.DataFrame]:
-    """Load scrips from ~/.kotak_neo/scrip_cache/ if available."""
+    """Load cached master scrip CSV from ~/.kotak_neo/scrip_cache/."""
     try:
         cache_dir = scrip_cache._cache_dir()
         cached_files = sorted(cache_dir.glob(f"{segment}_*.csv"), reverse=True)
@@ -108,30 +128,12 @@ def get_nifty_future_scrip(
     """
     Search Kotak Neo scrip master (nse_fo) to resolve contract details
     for NIFTY Futures (FUTIDX).
-
-    Resilient multi-tier strategy:
-    1. Try client.search_scrip()
-    2. Try local scrip cache (e.g. from previous runs)
-    3. Fallback to active near-month constant if off-hours network fails
-
-    Returns:
-        Dictionary containing contract metadata:
-        {
-            'instrument_token': str,
-            'trading_symbol': str,
-            'expiry_date': str,
-            'lot_size': int,
-            'tick_size': float,
-            'base_price': float,
-            'segment': str,
-            'raw': dict
-        }
     """
-    print(f"{Colors.BLUE}[*] Resolving {symbol} Futures from Kotak Neo Scrip Master (nse_fo)...{Colors.RESET}")
-    
+    print(f"[*] Querying Scrip Master for symbol='{symbol}' on segment='nse_fo'...\n")
+
     exact_futs: List[Dict[str, Any]] = []
 
-    # Strategy 1: Official client.search_scrip()
+    # 1. Official client.search_scrip()
     if client is not None:
         try:
             scrips = client.search_scrip(
@@ -146,10 +148,10 @@ def get_nifty_future_scrip(
                         and str(s.get("pInstType", "")).strip().upper() == "FUTIDX"
                     ):
                         exact_futs.append(s)
-        except Exception as e:
-            print(f"{Colors.DIM}    (API search_scrip unavailable: {e}. Trying local scrip cache...){Colors.RESET}")
+        except Exception:
+            pass
 
-    # Strategy 2: Local cache CSV (~/.kotak_neo/scrip_cache/nse_fo_*.csv)
+    # 2. Local cache CSV (~/.kotak_neo/scrip_cache/nse_fo_*.csv)
     if not exact_futs:
         df = _load_scrip_dataframe_from_cache("nse_fo")
         if df is not None and not df.empty:
@@ -162,10 +164,8 @@ def get_nifty_future_scrip(
                 )
                 filtered_df = df[mask].copy()
                 if not filtered_df.empty:
-                    # Format pExpiryDate if numeric epoch
                     if "pExpiryDate" in filtered_df.columns:
                         try:
-                            # Convert epoch seconds to human readable date
                             dt = pd.to_datetime(pd.to_numeric(filtered_df["pExpiryDate"], errors="coerce"), unit="s")
                             dt = dt + pd.to_timedelta(315511200, unit="s")
                             filtered_df["pExpiryDateStr"] = dt.dt.strftime("%d%b%Y")
@@ -177,29 +177,26 @@ def get_nifty_future_scrip(
                             r["pExpiryDate"] = r["pExpiryDateStr"]
                         exact_futs.append(r)
 
-    # Strategy 3: Built-in known near-month fallback (if Kotak API is completely down/503)
+    # 3. Known active fallback if off-hours network fails
     if not exact_futs and symbol.upper() == "NIFTY":
-        print(f"{Colors.YELLOW}[!] Using current active Nifty Future default (Token: 61471 / NIFTY26NOVFUT).{Colors.RESET}")
         return {
             "instrument_token": "61471",
             "trading_symbol": "NIFTY26NOVFUT",
             "expiry_date": "26Nov2026",
             "lot_size": 65,
             "tick_size": 0.05,
-            "base_price": 24500.0,
             "segment": "nse_fo",
-            "raw": {},
+            "inst_type": "FUTIDX",
         }
 
     if not exact_futs:
         raise ValueError(f"Could not resolve active {symbol} futures contracts in nse_fo.")
 
-    # Sort chronologically by lExpiryDate (epoch seconds)
+    # Sort chronologically by lExpiryDate
     exact_futs.sort(key=lambda s: int(s.get("lExpiryDate", 0) or 0))
 
     chosen_scrip: Optional[Dict[str, Any]] = None
 
-    # If user passed an expiry hint (e.g. OCT, NOV, 27Oct):
     if expiry_hint:
         hint_clean = expiry_hint.strip().upper().replace("TH", "").replace(" ", "")
         for s in exact_futs:
@@ -209,20 +206,7 @@ def get_nifty_future_scrip(
                 chosen_scrip = s
                 break
 
-        if not chosen_scrip:
-            available_contracts = [
-                f"{s.get('pTrdSymbol')} (Exp: {s.get('pExpiryDate')}, Token: {s.get('pSymbol')})"
-                for s in exact_futs
-            ]
-            print(
-                f"\n{Colors.YELLOW}[!] Notice: Expiry '{expiry_hint}' was not found in the active master file.\n"
-                f"    (Monthly futures expire on the final Thursday; expired contracts are dropped by the exchange).\n"
-                f"    Available active contracts:\n"
-                f"    - " + "\n    - ".join(available_contracts) + f"\n"
-                f"    Defaulting to Current Month / Near-Month active contract.{Colors.RESET}\n"
-            )
-
-    # Default to the first (near-month / current month) contract
+    # Default to the first (current month / near-month) active future
     if not chosen_scrip:
         chosen_scrip = exact_futs[0]
 
@@ -231,7 +215,6 @@ def get_nifty_future_scrip(
     expiry_str = str(chosen_scrip.get("pExpiryDate"))
     lot_size = int(chosen_scrip.get("lLotSize") or chosen_scrip.get("iLotSize") or 65)
     tick_size = float(chosen_scrip.get("dTickSize") or 10) / 100.0 if chosen_scrip.get("dTickSize") else 0.05
-    base_price = float(chosen_scrip.get("pScripBasePrice") or 0) / 100.0 if chosen_scrip.get("pScripBasePrice") else 0.0
 
     return {
         "instrument_token": token,
@@ -239,93 +222,92 @@ def get_nifty_future_scrip(
         "expiry_date": expiry_str,
         "lot_size": lot_size,
         "tick_size": tick_size,
-        "base_price": base_price,
         "segment": "nse_fo",
+        "inst_type": "FUTIDX",
         "raw": chosen_scrip,
     }
 
 
-def display_scrip_card(scrip_info: Dict[str, Any]) -> None:
-    """Print formatted scrip metadata card."""
-    print_banner("CONTRACT DETAILS RESOLVED", Colors.CYAN)
-    print(f"  {Colors.BOLD}Trading Symbol  :{Colors.RESET} {Colors.GREEN}{Colors.BOLD}{scrip_info['trading_symbol']}{Colors.RESET}")
-    print(f"  {Colors.BOLD}Instrument Token:{Colors.RESET} {Colors.YELLOW}{Colors.BOLD}{scrip_info['instrument_token']}{Colors.RESET}")
-    print(f"  {Colors.BOLD}Exchange Segment:{Colors.RESET} {scrip_info['segment']}")
-    print(f"  {Colors.BOLD}Expiry Date     :{Colors.RESET} {scrip_info['expiry_date']}")
-    print(f"  {Colors.BOLD}Lot Size        :{Colors.RESET} {scrip_info['lot_size']}")
-    print(f"  {Colors.BOLD}Tick Size       :{Colors.RESET} {scrip_info['tick_size']}")
-    if scrip_info.get("base_price"):
-        print(f"  {Colors.BOLD}Prev Close / Base Price:{Colors.RESET} Rs. {scrip_info['base_price']:,.2f}")
-    print("=" * 62 + "\n")
-
-
 # =====================================================================
-# Market Data Display Formatter
+# Boxed Contract Card & Table Formatter
 # =====================================================================
 
-def format_tick_display(
-    msg: SFeedScrip,
-    trading_symbol: str,
-    tick_number: int,
-    show_depth: bool = False,
-) -> None:
-    """Pretty-print a market data tick."""
-    now_str = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+def display_contract_box(info: Dict[str, Any]) -> None:
+    """Print the exact boxed contract summary card shown in the screenshot."""
+    w = 60
+    title = "KOTAK NEO SFEED WEBSOCKET - LIVE MARKET DATA"
+    top = "┌" + "─" * w + "┐"
+    mid = "├" + "─" * w + "┤"
+    bot = "└" + "─" * w + "┘"
+
+    r1 = " Trading Symbol  : " + str(info["trading_symbol"]).ljust(16) + "Segment   : " + str(info["segment"]).ljust(10)
+    r2 = " Instrument Token: " + str(info["instrument_token"]).ljust(16) + "Inst Type : " + str(info.get("inst_type", "FUTIDX")).ljust(10)
+    r3 = " Expiry Date     : " + str(info["expiry_date"]).ljust(16) + "Market Lot: " + str(info["lot_size"]).ljust(10)
+
+    # Print in bright cyan color
+    cyan = Colors.CYAN
+    reset = Colors.RESET
+
+    print(f"{cyan}{top}")
+    print(f"│{title.center(w)}│")
+    print(f"{mid}")
+    print(f"│{r1.ljust(w)}│")
+    print(f"│{r2.ljust(w)}│")
+    print(f"│{r3.ljust(w)}│")
+    print(f"{bot}{reset}\n")
+
+
+def print_table_header() -> None:
+    """Print the table column header and divider line."""
+    print("[*] Streaming live ticks (Press Ctrl+C to disconnect safely)...\n")
+    header = "  TIME   |   LTP (₹)   |      CHANGE      |   HIGH (₹)   |   LOW (₹)    | OPEN INTEREST"
+    divider = "─" * 90
+    print(f"{Colors.BOLD}{header}{Colors.RESET}")
+    print(divider)
+
+
+def format_table_row(msg: SFeedScrip) -> str:
+    """Format an incoming market data tick as a table row."""
+    # Timestamp
+    if msg.last_trade_time and msg.last_trade_time > 0:
+        time_str = datetime.datetime.fromtimestamp(msg.last_trade_time).strftime("%H:%M:%S")
+    else:
+        time_str = datetime.datetime.now().strftime("%H:%M:%S")
+
     ltp = msg.last_traded_price
     net_chg = msg.net_change
-    chg_pct = msg.net_change_percent
+    pct_chg = msg.net_change_percent
+    high = msg.high_price
+    low = msg.low_price
+    oi = msg.open_interest
 
-    # Color code price change
-    if net_chg > 0:
-        chg_color = Colors.GREEN
-        sign = "+"
-    elif net_chg < 0:
-        chg_color = Colors.RED
-        sign = ""
+    # Determine color
+    if net_chg < 0:
+        color = Colors.RED
+        chg_text = f"{net_chg:.2f} ({pct_chg:.2f}%)"
+    elif net_chg > 0:
+        color = Colors.GREEN
+        chg_text = f"+{net_chg:.2f} (+{pct_chg:.2f}%)"
     else:
-        chg_color = Colors.RESET
-        sign = " "
+        color = Colors.RESET
+        chg_text = f"0.00 (0.00%)"
 
-    header_line = (
-        f"{Colors.DIM}[{now_str} #{tick_number:04d}]{Colors.RESET} "
-        f"{Colors.BOLD}{trading_symbol}{Colors.RESET} "
-        f"LTP: {chg_color}{Colors.BOLD}{ltp:,.2f}{Colors.RESET} "
-        f"({chg_color}{sign}{net_chg:,.2f} / {sign}{chg_pct:.2f}%{Colors.RESET})"
+    # Pad raw text to fixed widths before applying color codes
+    ltp_text = f"₹ {ltp:>9,.2f}"
+    chg_padded = f"{chg_text:>16}"
+
+    ltp_display = f"{color}{Colors.BOLD}{ltp_text}{Colors.RESET}"
+    chg_display = f"{color}{chg_padded}{Colors.RESET}"
+
+    row = (
+        f" {time_str} | {ltp_display} | {chg_display} | "
+        f" {high:>10,.2f}  |  {low:>10,.2f}  | {oi:>13,}"
     )
-    print(header_line)
-
-    stats_line = (
-        f"    {Colors.DIM}Open:{Colors.RESET} {msg.open_price:,.2f}  "
-        f"{Colors.DIM}High:{Colors.RESET} {msg.high_price:,.2f}  "
-        f"{Colors.DIM}Low:{Colors.RESET} {msg.low_price:,.2f}  "
-        f"{Colors.DIM}Close:{Colors.RESET} {msg.close_price:,.2f}  "
-        f"{Colors.DIM}Volume:{Colors.RESET} {msg.volume_traded_today:,}  "
-        f"{Colors.DIM}OI:{Colors.RESET} {msg.open_interest:,}"
-    )
-    print(stats_line)
-
-    # Best Bid & Ask
-    best_bid = msg.buy[0] if msg.buy else None
-    best_ask = msg.sell[0] if msg.sell else None
-    bid_str = f"{best_bid.quantity} @ {best_bid.price:,.2f}" if best_bid else "N/A"
-    ask_str = f"{best_ask.price:,.2f} @ {best_ask.quantity}" if best_ask else "N/A"
-    print(f"    {Colors.GREEN}Best Bid:{Colors.RESET} {bid_str}  |  {Colors.RED}Best Ask:{Colors.RESET} {ask_str}")
-
-    if show_depth and (len(msg.buy) > 1 or len(msg.sell) > 1):
-        print(f"    {Colors.DIM}--- Market Depth (Top 5) ---{Colors.RESET}")
-        depth_len = max(len(msg.buy), len(msg.sell))
-        for i in range(min(5, depth_len)):
-            b = msg.buy[i] if i < len(msg.buy) else None
-            a = msg.sell[i] if i < len(msg.sell) else None
-            b_txt = f"{b.orders:2d} orders | {b.quantity:5d} @ {b.price:,.2f}" if b else " " * 28
-            a_txt = f"{a.price:,.2f} @ {a.quantity:5d} | {a.orders:2d} orders" if a else ""
-            print(f"      {Colors.GREEN}{b_txt}{Colors.RESET}   |   {Colors.RED}{a_txt}{Colors.RESET}")
-
-    print()
+    return row
 
 
 # =====================================================================
-# Main WebSocket Streaming Engine
+# WebSocket Streaming Engine
 # =====================================================================
 
 async def stream_live_quotes(
@@ -334,67 +316,32 @@ async def stream_live_quotes(
     exchange_segment: str = "nse_fo",
     trading_symbol: Optional[str] = None,
     max_ticks: Optional[int] = None,
-    show_depth: bool = False,
-    on_quote: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> None:
-    """
-    Connect to Kotak Neo SFeed WebSocket and stream live quotes.
-
-    Parameters:
-        client: Authenticated NeoAPI client instance
-        instrument_token: Token string (e.g. '61471')
-        exchange_segment: Segment (e.g. 'nse_fo')
-        trading_symbol: Display symbol name
-        max_ticks: Exit after receiving this number of ticks (None for infinite)
-        show_depth: If True, subscribes to depth (Level 8) and displays top 5 depth
-        on_quote: Optional callback invoked with parsed quote dict for each tick
-    """
-    sym = trading_symbol or f"Token-{instrument_token}"
+    """Connect to SFeed WebSocket and stream live ticks into the table."""
     ws_token = WsToken(exchange_segment=exchange_segment, instrument_token=str(instrument_token))
-
-    print(f"{Colors.BLUE}[*] Connecting to Kotak Neo SFeed WebSocket...{Colors.RESET}")
-    print(f"{Colors.DIM}    Subscribing to {exchange_segment} | Token: {instrument_token} ({sym}){Colors.RESET}")
-    print(f"{Colors.DIM}    Press Ctrl + C at any time to disconnect.{Colors.RESET}\n")
-
     tick_count = 0
 
     try:
         async with client.create_websocket() as ws:
-            print(f"{Colors.GREEN}[OK] WebSocket Connected & Authenticated successfully!{Colors.RESET}")
-            
-            # Subscribe to touch-line or full depth
-            if show_depth:
-                await ws.subscribe_depth([ws_token])
-                print(f"{Colors.CYAN}[*] Subscribed with Level 8 Depth (Top 5 Bid/Ask). Awaiting market ticks...{Colors.RESET}\n")
-            else:
-                await ws.subscribe_scrips([ws_token])
-                print(f"{Colors.CYAN}[*] Subscribed to Level 4 Market Feed. Awaiting market ticks...{Colors.RESET}\n")
+            # Subscribe to touch-line feed
+            await ws.subscribe_scrips([ws_token])
 
             async for message in ws:
-                # Handle Scrip tick updates
                 if isinstance(message, SFeedScrip) or getattr(message, "type", "") == "scrip":
                     if str(message.instrument_token) == str(instrument_token):
                         tick_count += 1
-                        display_sym = message.trading_symbol or sym
-                        format_tick_display(message, display_sym, tick_count, show_depth=show_depth)
-
-                        if on_quote:
-                            try:
-                                on_quote(message.model_dump() if hasattr(message, "model_dump") else message.__dict__)
-                            except Exception as cb_err:
-                                print(f"{Colors.YELLOW}[!] Callback error: {cb_err}{Colors.RESET}")
+                        row_line = format_table_row(message)
+                        print(row_line)
 
                         if max_ticks and tick_count >= max_ticks:
-                            print(f"{Colors.GREEN}[OK] Reached target tick count ({max_ticks}). Exiting stream.{Colors.RESET}")
                             break
 
     except asyncio.CancelledError:
-        print(f"\n{Colors.YELLOW}[!] Stream cancelled.{Colors.RESET}")
+        pass
     except KeyboardInterrupt:
-        print(f"\n{Colors.YELLOW}[!] WebSocket streaming interrupted by user.{Colors.RESET}")
+        pass
     except Exception as e:
-        print(f"\n{Colors.RED}[X] WebSocket error: {e}{Colors.RESET}")
-        raise
+        print(f"\n{Colors.RED}[X] Stream disconnected: {e}{Colors.RESET}")
 
 
 # =====================================================================
@@ -403,7 +350,7 @@ async def stream_live_quotes(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Kotak Neo API Live WebSocket Market Data Streamer for Nifty Futures.",
+        description="Kotak Neo API Live SFeed WebSocket Market Data Streamer.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -416,30 +363,24 @@ def parse_args() -> argparse.Namespace:
         "-e", "--expiry",
         type=str,
         default=None,
-        help="Optional expiry filter or hint (e.g. 'NOV', '26NOV', 'OCT')",
+        help="Optional expiry filter or hint (e.g. 'NOV', 'OCT')",
     )
     parser.add_argument(
         "-t", "--token",
         type=str,
         default=None,
-        help="Direct instrument token override (e.g. 61471). Skips scrip master search.",
-    )
-    parser.add_argument(
-        "--segment",
-        type=str,
-        default="nse_fo",
-        help="Exchange segment (nse_fo, nse_cm, bse_cm, mcx_fo)",
-    )
-    parser.add_argument(
-        "--depth",
-        action="store_true",
-        help="Subscribe to 5-level Market Depth (Level 8) instead of touch-line.",
+        help="Direct instrument token override (e.g. 61471).",
     )
     parser.add_argument(
         "-c", "--count",
         type=int,
         default=None,
-        help="Stop after receiving N ticks (useful for automated checks).",
+        help="Stop after receiving N ticks (useful for automated testing).",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show verbose login details before the table.",
     )
     return parser.parse_args()
 
@@ -447,26 +388,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    print_banner("KOTAK NEO LIVE WEBSOCKET STREAMER", Colors.CYAN)
-    print("Real-time Market Feed for Nifty Current Month Future\n")
-
-    # Step 1: Authentication
+    # Step 1: Quiet Authentication
     try:
-        client, user_info = login()
+        client = silent_login(verbose=args.verbose)
     except Exception as e:
-        print(f"\n{Colors.RED}[X] Login failed: {e}{Colors.RESET}")
+        print(f"\n{Colors.RED}[X] Authentication failed: {e}{Colors.RESET}")
         sys.exit(1)
 
-    # Step 2: Resolve Scrip Token & Contract Metadata
+    # Step 2: Query Scrip Master
     if args.token:
+        print(f"[*] Querying Scrip Master for symbol='{args.symbol}' on segment='nse_fo'...\n")
         scrip_info = {
             "instrument_token": str(args.token),
             "trading_symbol": f"{args.symbol.upper()}-{args.token}",
             "expiry_date": "Manual Override",
             "lot_size": 65,
             "tick_size": 0.05,
-            "base_price": 0.0,
-            "segment": args.segment,
+            "segment": "nse_fo",
+            "inst_type": "FUTIDX",
         }
     else:
         try:
@@ -479,10 +418,13 @@ def main() -> None:
             print(f"{Colors.RED}[X] Scrip resolution error: {scrip_err}{Colors.RESET}")
             sys.exit(1)
 
-    # Display Contract Summary
-    display_scrip_card(scrip_info)
+    # Step 3: Print Boxed Contract Card
+    display_contract_box(scrip_info)
 
-    # Step 3: Run Async WebSocket Stream
+    # Step 4: Print Table Header
+    print_table_header()
+
+    # Step 5: Start Live Stream Loop
     try:
         asyncio.run(
             stream_live_quotes(
@@ -491,13 +433,12 @@ def main() -> None:
                 exchange_segment=scrip_info["segment"],
                 trading_symbol=scrip_info["trading_symbol"],
                 max_ticks=args.count,
-                show_depth=args.depth,
             )
         )
     except KeyboardInterrupt:
-        print(f"\n{Colors.YELLOW}[!] WebSocket stopped by user. Goodbye!{Colors.RESET}\n")
+        print(f"\n{Colors.YELLOW}[!] Streaming stopped. Goodbye!{Colors.RESET}\n")
     except Exception as exc:
-        print(f"\n{Colors.RED}[X] WebSocket execution terminated: {exc}{Colors.RESET}\n")
+        print(f"\n{Colors.RED}[X] Streaming error: {exc}{Colors.RESET}\n")
         sys.exit(1)
 
 

@@ -1,3 +1,6 @@
 .env
 logs/
 venv/
+__pycache__/
+*.pyc
+kotak-neo-python/

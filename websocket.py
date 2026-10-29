@@ -19,14 +19,12 @@ UI Layout:
 
   TIME   |   LTP (₹)   |      CHANGE      |   HIGH (₹)   |   LOW (₹)    | OPEN INTEREST
 ──────────────────────────────────────────────────────────────────────────────────────────
- 09:15:02 | ₹ 24,525.50 |  +25.50 (+0.10%) |  24,540.00   |   24,495.00  |    16,050,000
+ 09:15:02 | ₹ 24,525.50 |  +25.50 (+0.10%) |   24,540.00  |   24,495.00  |    16,050,000
 """
 
 import argparse
 import asyncio
-import contextlib
 import datetime
-import io
 import logging
 import os
 import sys
@@ -44,7 +42,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Silence noisy SDK background logger output so it doesn't break the table
+# Silence noisy SDK background logger output so it doesn't break table rows
 logging.getLogger("neo_api_client").setLevel(logging.ERROR)
 logging.getLogger("websockets").setLevel(logging.ERROR)
 try:
@@ -72,33 +70,6 @@ except ImportError as err:
     sys.exit(1)
 
 from login import Colors, load_env_file, login
-
-
-# =====================================================================
-# Silent Authentication Helper
-# =====================================================================
-
-def silent_login(verbose: bool = False) -> NeoAPI:
-    """
-    Authenticate with Kotak Neo.
-    If verbose is False and credentials exist in .env, suppresses login banners
-    so the terminal opens cleanly into the live market table.
-    """
-    load_env_file()
-    has_env = all(
-        os.environ.get(k)
-        for k in ["NEO_CONSUMER_KEY", "NEO_MOBILE_NUMBER", "NEO_UCC", "NEO_MPIN"]
-    )
-
-    if not verbose and has_env:
-        # Suppress login banners to keep terminal output clean
-        devnull = io.StringIO()
-        with contextlib.redirect_stdout(devnull):
-            client, _ = login(show_limits=False)
-        return client
-    else:
-        client, _ = login(show_limits=False)
-        return client
 
 
 # =====================================================================
@@ -244,7 +215,6 @@ def display_contract_box(info: Dict[str, Any]) -> None:
     r2 = " Instrument Token: " + str(info["instrument_token"]).ljust(16) + "Inst Type : " + str(info.get("inst_type", "FUTIDX")).ljust(10)
     r3 = " Expiry Date     : " + str(info["expiry_date"]).ljust(16) + "Market Lot: " + str(info["lot_size"]).ljust(10)
 
-    # Print in bright cyan color
     cyan = Colors.CYAN
     reset = Colors.RESET
 
@@ -268,7 +238,6 @@ def print_table_header() -> None:
 
 def format_table_row(msg: SFeedScrip) -> str:
     """Format an incoming market data tick as a table row."""
-    # Timestamp
     if msg.last_trade_time and msg.last_trade_time > 0:
         time_str = datetime.datetime.fromtimestamp(msg.last_trade_time).strftime("%H:%M:%S")
     else:
@@ -281,7 +250,6 @@ def format_table_row(msg: SFeedScrip) -> str:
     low = msg.low_price
     oi = msg.open_interest
 
-    # Determine color
     if net_chg < 0:
         color = Colors.RED
         chg_text = f"{net_chg:.2f} ({pct_chg:.2f}%)"
@@ -290,9 +258,8 @@ def format_table_row(msg: SFeedScrip) -> str:
         chg_text = f"+{net_chg:.2f} (+{pct_chg:.2f}%)"
     else:
         color = Colors.RESET
-        chg_text = f"0.00 (0.00%)"
+        chg_text = "0.00 (0.00%)"
 
-    # Pad raw text to fixed widths before applying color codes
     ltp_text = f"₹ {ltp:>9,.2f}"
     chg_padded = f"{chg_text:>16}"
 
@@ -372,15 +339,16 @@ def parse_args() -> argparse.Namespace:
         help="Direct instrument token override (e.g. 61471).",
     )
     parser.add_argument(
+        "--totp",
+        type=str,
+        default=None,
+        help="Optional 6-digit TOTP code passed via command line.",
+    )
+    parser.add_argument(
         "-c", "--count",
         type=int,
         default=None,
         help="Stop after receiving N ticks (useful for automated testing).",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Show verbose login details before the table.",
     )
     return parser.parse_args()
 
@@ -388,12 +356,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Step 1: Quiet Authentication
+    # Step 1: Authentication (Prompts for TOTP if required)
     try:
-        client = silent_login(verbose=args.verbose)
+        client, user_info = login(totp=args.totp, show_limits=False)
     except Exception as e:
         print(f"\n{Colors.RED}[X] Authentication failed: {e}{Colors.RESET}")
         sys.exit(1)
+
+    print()  # Spacer line
 
     # Step 2: Query Scrip Master
     if args.token:
